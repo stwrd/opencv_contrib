@@ -12,6 +12,7 @@ int main() {
     cfg.input_channels = 1;
     cfg.motion_estimator = 1; // KLT optical flow
     cfg.smoothing_mode = 1;   // Gaussian smoothing
+    cfg.motion_model = 1;     // Affine model
 
     rtsdk::Stabilizer sdk(cfg);
 

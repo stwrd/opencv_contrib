@@ -1,24 +1,61 @@
 #include "realtime_stab_sdk.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <numeric>
 #include <utility>
 #include <vector>
 
 namespace rtsdk {
 namespace {
 
+struct Motion2D {
+    // [a00 a01 tx; a10 a11 ty]
+    float a00, a01, tx;
+    float a10, a11, ty;
+};
+
+inline Motion2D identity_motion() {
+    Motion2D m;
+    m.a00 = 1.f; m.a01 = 0.f; m.tx = 0.f;
+    m.a10 = 0.f; m.a11 = 1.f; m.ty = 0.f;
+    return m;
+}
+
+inline Motion2D compose_motion(const Motion2D& A, const Motion2D& B) {
+    // A * B
+    Motion2D o;
+    o.a00 = A.a00 * B.a00 + A.a01 * B.a10;
+    o.a01 = A.a00 * B.a01 + A.a01 * B.a11;
+    o.tx  = A.a00 * B.tx  + A.a01 * B.ty + A.tx;
+    o.a10 = A.a10 * B.a00 + A.a11 * B.a10;
+    o.a11 = A.a10 * B.a01 + A.a11 * B.a11;
+    o.ty  = A.a10 * B.tx  + A.a11 * B.ty + A.ty;
+    return o;
+}
+
+inline bool invert_motion(const Motion2D& M, Motion2D& inv) {
+    const float det = M.a00 * M.a11 - M.a01 * M.a10;
+    if (std::fabs(det) < 1e-7f) return false;
+    const float id = 1.f / det;
+
+    inv.a00 =  M.a11 * id;
+    inv.a01 = -M.a01 * id;
+    inv.a10 = -M.a10 * id;
+    inv.a11 =  M.a00 * id;
+    inv.tx = -(inv.a00 * M.tx + inv.a01 * M.ty);
+    inv.ty = -(inv.a10 * M.tx + inv.a11 * M.ty);
+    return true;
+}
+
 inline int sample_ch(const uint8_t* frame, int w, int h, int c, int channels,
                      int x, int y, int border_mode) {
     if (x >= 0 && x < w && y >= 0 && y < h) {
         return frame[(y * w + x) * channels + c];
     }
-    if (border_mode == 0) {
-        return 0;
-    }
+    if (border_mode == 0) return 0;
     const int cx = std::min(std::max(x, 0), w - 1);
     const int cy = std::min(std::max(y, 0), h - 1);
     return frame[(cy * w + cx) * channels + c];
@@ -82,6 +119,38 @@ inline float median(std::vector<float>& vals) {
     return med;
 }
 
+inline bool solve_linear_6x6(float A[6][6], float b[6], float x[6]) {
+    for (int col = 0; col < 6; ++col) {
+        int pivot = col;
+        float maxv = std::fabs(A[col][col]);
+        for (int r = col + 1; r < 6; ++r) {
+            const float v = std::fabs(A[r][col]);
+            if (v > maxv) {
+                maxv = v;
+                pivot = r;
+            }
+        }
+        if (maxv < 1e-7f) return false;
+        if (pivot != col) {
+            for (int c = col; c < 6; ++c) std::swap(A[col][c], A[pivot][c]);
+            std::swap(b[col], b[pivot]);
+        }
+
+        const float inv = 1.f / A[col][col];
+        for (int c = col; c < 6; ++c) A[col][c] *= inv;
+        b[col] *= inv;
+
+        for (int r = 0; r < 6; ++r) {
+            if (r == col) continue;
+            const float f = A[r][col];
+            for (int c = col; c < 6; ++c) A[r][c] -= f * A[col][c];
+            b[r] -= f * b[col];
+        }
+    }
+    for (int i = 0; i < 6; ++i) x[i] = b[i];
+    return true;
+}
+
 } // namespace
 
 struct Stabilizer::Impl {
@@ -101,6 +170,7 @@ struct Stabilizer::Impl {
         cfg.klt_epsilon = std::max(cfg.klt_epsilon, 0.0001f);
         cfg.smoothing_mode = (cfg.smoothing_mode == 0) ? 0 : 1;
         cfg.gaussian_radius = std::max(cfg.gaussian_radius, 1);
+        cfg.motion_model = (cfg.motion_model == 0) ? 0 : 1;
         if (cfg.gaussian_sigma <= 0.f) {
             cfg.gaussian_sigma = std::max(static_cast<float>(cfg.gaussian_radius) * 0.5f, 1.f);
         }
@@ -109,6 +179,10 @@ struct Stabilizer::Impl {
         gray_curr.resize(cfg.width * cfg.height);
         frame_scratch.resize(static_cast<size_t>(cfg.width) * static_cast<size_t>(cfg.height) *
                              static_cast<size_t>(cfg.input_channels));
+        for (int i = 0; i < 6; ++i) {
+            path_hist[i].reserve(4096);
+            smooth_params[i] = (i == 0 || i == 3) ? 1.f : 0.f;
+        }
     }
 
     StabilizerConfig cfg;
@@ -117,12 +191,9 @@ struct Stabilizer::Impl {
     std::vector<uint8_t> gray_curr;
     std::vector<uint8_t> frame_scratch;
 
-    float path_x = 0.f;
-    float path_y = 0.f;
-    float smooth_x = 0.f;
-    float smooth_y = 0.f;
-    std::vector<float> path_hist_x;
-    std::vector<float> path_hist_y;
+    Motion2D cumulative_motion = identity_motion();
+    float smooth_params[6];
+    std::vector<float> path_hist[6];
     std::vector<float> gauss_weights;
 
     void init_gaussian_kernel() {
@@ -135,46 +206,44 @@ struct Stabilizer::Impl {
             sum += w;
         }
         if (sum > 0.f) {
-            for (size_t i = 0; i < gauss_weights.size(); ++i) {
-                gauss_weights[i] /= sum;
-            }
+            for (size_t i = 0; i < gauss_weights.size(); ++i) gauss_weights[i] /= sum;
         }
     }
 
-    std::pair<float, float> smooth_path(float px, float py) {
-        path_hist_x.push_back(px);
-        path_hist_y.push_back(py);
+    float smooth_scalar(int idx, float v) {
+        std::vector<float>& hist = path_hist[idx];
+        hist.push_back(v);
 
         if (cfg.smoothing_mode == 0) {
-            const float a = std::min(std::max(cfg.ema_alpha, 0.f), 0.9999f);
-            smooth_x = a * smooth_x + (1.f - a) * px;
-            smooth_y = a * smooth_y + (1.f - a) * py;
-            return std::make_pair(smooth_x, smooth_y);
+            const float a = cfg.ema_alpha;
+            smooth_params[idx] = a * smooth_params[idx] + (1.f - a) * v;
+            return smooth_params[idx];
         }
 
-        if (gauss_weights.empty()) {
-            init_gaussian_kernel();
-        }
-
-        float sx = 0.f;
-        float sy = 0.f;
-        float sw = 0.f;
-        const int n = static_cast<int>(path_hist_x.size()) - 1;
+        if (gauss_weights.empty()) init_gaussian_kernel();
+        float s = 0.f, sw = 0.f;
+        const int n = static_cast<int>(hist.size()) - 1;
         for (int k = 0; k <= cfg.gaussian_radius; ++k) {
-            const int idx = n - k;
-            if (idx < 0) break;
+            const int p = n - k;
+            if (p < 0) break;
             const float w = gauss_weights[static_cast<size_t>(k)];
-            sx += path_hist_x[static_cast<size_t>(idx)] * w;
-            sy += path_hist_y[static_cast<size_t>(idx)] * w;
+            s += hist[static_cast<size_t>(p)] * w;
             sw += w;
         }
-        if (sw > 1e-6f) {
-            sx /= sw;
-            sy /= sw;
-        }
-        smooth_x = sx;
-        smooth_y = sy;
-        return std::make_pair(smooth_x, smooth_y);
+        if (sw > 1e-6f) s /= sw;
+        smooth_params[idx] = s;
+        return s;
+    }
+
+    Motion2D smooth_cumulative_motion(const Motion2D& cum) {
+        Motion2D out;
+        out.a00 = smooth_scalar(0, cum.a00);
+        out.a01 = smooth_scalar(1, cum.a01);
+        out.tx  = smooth_scalar(2, cum.tx);
+        out.a10 = smooth_scalar(3, cum.a10);
+        out.a11 = smooth_scalar(4, cum.a11);
+        out.ty  = smooth_scalar(5, cum.ty);
+        return out;
     }
 
     void to_gray(const uint8_t* input, std::vector<uint8_t>& gray) const {
@@ -183,7 +252,6 @@ struct Stabilizer::Impl {
             std::memcpy(gray.data(), input, static_cast<size_t>(n));
             return;
         }
-
         for (int i = 0; i < n; ++i) {
             const int b = input[i * cfg.input_channels + 0];
             const int g = input[i * cfg.input_channels + 1];
@@ -192,45 +260,36 @@ struct Stabilizer::Impl {
         }
     }
 
-    std::pair<float, float> estimate_motion() const {
-        if (cfg.motion_estimator == 1) {
-            return estimate_motion_klt();
-        }
+    Motion2D estimate_motion() const {
+        if (cfg.motion_estimator == 1) return estimate_motion_klt();
         return estimate_motion_sad();
     }
 
-    std::pair<float, float> estimate_motion_sad() const {
+    Motion2D estimate_motion_sad() const {
         std::vector<float> dxs;
         std::vector<float> dys;
         dxs.reserve(static_cast<size_t>(cfg.grid_cols * cfg.grid_rows));
         dys.reserve(static_cast<size_t>(cfg.grid_cols * cfg.grid_rows));
 
         const int margin = std::max(cfg.patch_radius + cfg.search_radius + 1, 8);
-        const int x0 = margin;
-        const int y0 = margin;
+        const int x0 = margin, y0 = margin;
         const int x1 = cfg.width - margin - 1;
         const int y1 = cfg.height - margin - 1;
-        if (x1 <= x0 || y1 <= y0) {
-            return std::make_pair(0.f, 0.f);
-        }
+        if (x1 <= x0 || y1 <= y0) return identity_motion();
 
         for (int gy = 0; gy < cfg.grid_rows; ++gy) {
             const float fy = (cfg.grid_rows == 1) ? 0.f : static_cast<float>(gy) / static_cast<float>(cfg.grid_rows - 1);
             const int y = static_cast<int>(y0 + fy * static_cast<float>(y1 - y0));
-
             for (int gx = 0; gx < cfg.grid_cols; ++gx) {
                 const float fx = (cfg.grid_cols == 1) ? 0.f : static_cast<float>(gx) / static_cast<float>(cfg.grid_cols - 1);
                 const int x = static_cast<int>(x0 + fx * static_cast<float>(x1 - x0));
 
                 int best_sad = std::numeric_limits<int>::max();
-                int best_dx = 0;
-                int best_dy = 0;
-
+                int best_dx = 0, best_dy = 0;
                 for (int dy = -cfg.search_radius; dy <= cfg.search_radius; ++dy) {
                     for (int dx = -cfg.search_radius; dx <= cfg.search_radius; ++dx) {
-                        const int sad = sad_patch(gray_prev.data(), gray_curr.data(),
-                                                  cfg.width, cfg.height, x, y,
-                                                  dx, dy, cfg.patch_radius);
+                        const int sad = sad_patch(gray_prev.data(), gray_curr.data(), cfg.width, cfg.height,
+                                                  x, y, dx, dy, cfg.patch_radius);
                         if (sad < best_sad) {
                             best_sad = sad;
                             best_dx = dx;
@@ -238,16 +297,54 @@ struct Stabilizer::Impl {
                         }
                     }
                 }
-
                 dxs.push_back(static_cast<float>(best_dx));
                 dys.push_back(static_cast<float>(best_dy));
             }
         }
 
-        return std::make_pair(median(dxs), median(dys));
+        Motion2D m = identity_motion();
+        m.tx = median(dxs);
+        m.ty = median(dys);
+        return m;
     }
 
-    std::pair<float, float> estimate_motion_klt() const {
+    bool estimate_affine_from_matches(const std::vector<float>& xs,
+                                      const std::vector<float>& ys,
+                                      const std::vector<float>& us,
+                                      const std::vector<float>& vs,
+                                      Motion2D& out) const {
+        if (xs.size() < 6U) return false;
+
+        float ATA[6][6] = {{0}};
+        float ATb[6] = {0};
+
+        for (size_t i = 0; i < xs.size(); ++i) {
+            const float x = xs[i], y = ys[i];
+            const float u = us[i], v = vs[i];
+
+            const float r1[6] = {x, y, 1.f, 0.f, 0.f, 0.f};
+            const float r2[6] = {0.f, 0.f, 0.f, x, y, 1.f};
+
+            for (int r = 0; r < 6; ++r) {
+                for (int c = 0; c < 6; ++c) {
+                    ATA[r][c] += r1[r] * r1[c] + r2[r] * r2[c];
+                }
+                ATb[r] += r1[r] * u + r2[r] * v;
+            }
+        }
+
+        float sol[6] = {0};
+        if (!solve_linear_6x6(ATA, ATb, sol)) return false;
+
+        out.a00 = sol[0]; out.a01 = sol[1]; out.tx = sol[2];
+        out.a10 = sol[3]; out.a11 = sol[4]; out.ty = sol[5];
+
+        const float det = out.a00 * out.a11 - out.a01 * out.a10;
+        if (std::fabs(det) < 1e-5f) return false;
+        return true;
+    }
+
+    Motion2D estimate_motion_klt() const {
         struct Pt { float x, y; };
         std::vector<Pt> features;
         features.reserve(static_cast<size_t>(cfg.max_features * 2));
@@ -256,12 +353,10 @@ struct Stabilizer::Impl {
         const int h = cfg.height;
         const int r = cfg.klt_win_radius;
         const int border = std::max(6, r + 2);
-        const int step = 4;
 
-        // 1) lightweight Shi-Tomasi feature picking
         std::vector<std::pair<float, Pt>> candidates;
-        for (int y = border; y < h - border; y += step) {
-            for (int x = border; x < w - border; x += step) {
+        for (int y = border; y < h - border; y += 4) {
+            for (int x = border; x < w - border; x += 4) {
                 float sxx = 0.f, syy = 0.f, sxy = 0.f;
                 for (int wy = -1; wy <= 1; ++wy) {
                     for (int wx = -1; wx <= 1; ++wx) {
@@ -271,9 +366,7 @@ struct Stabilizer::Impl {
                                          static_cast<float>(gray_prev[yy * w + (xx - 1)]);
                         const float iy = static_cast<float>(gray_prev[(yy + 1) * w + xx]) -
                                          static_cast<float>(gray_prev[(yy - 1) * w + xx]);
-                        sxx += ix * ix;
-                        syy += iy * iy;
-                        sxy += ix * iy;
+                        sxx += ix * ix; syy += iy * iy; sxy += ix * iy;
                     }
                 }
                 const float tr = sxx + syy;
@@ -281,43 +374,37 @@ struct Stabilizer::Impl {
                 const float disc = std::max(tr * tr - 4.f * det, 0.f);
                 const float min_eig = 0.5f * (tr - std::sqrt(disc));
                 if (min_eig > 1000.f) {
-                    candidates.push_back(std::make_pair(min_eig, Pt{static_cast<float>(x), static_cast<float>(y)}));
+                    Pt p = {static_cast<float>(x), static_cast<float>(y)};
+                    candidates.push_back(std::make_pair(min_eig, p));
                 }
             }
         }
 
         std::sort(candidates.begin(), candidates.end(),
-                  [](const std::pair<float, Pt>& a, const std::pair<float, Pt>& b) {
-                      return a.first > b.first;
-                  });
+                  [](const std::pair<float, Pt>& a, const std::pair<float, Pt>& b){ return a.first > b.first; });
 
-        const float min_dist2 = 9.f * 9.f;
+        const float min_dist2 = 81.f;
         for (size_t i = 0; i < candidates.size() && static_cast<int>(features.size()) < cfg.max_features; ++i) {
-            const Pt p = candidates[i].second;
+            Pt p = candidates[i].second;
             bool good = true;
             for (size_t j = 0; j < features.size(); ++j) {
                 const float dx = features[j].x - p.x;
                 const float dy = features[j].y - p.y;
-                if (dx * dx + dy * dy < min_dist2) {
-                    good = false;
-                    break;
-                }
+                if (dx * dx + dy * dy < min_dist2) { good = false; break; }
             }
             if (good) features.push_back(p);
         }
 
-        if (features.empty()) return std::make_pair(0.f, 0.f);
+        if (features.empty()) return identity_motion();
 
-        // 2) iterative LK tracking
-        std::vector<float> dxs;
-        std::vector<float> dys;
-        dxs.reserve(features.size());
-        dys.reserve(features.size());
+        std::vector<float> dxs, dys;
+        std::vector<float> xs, ys, us, vs;
+        dxs.reserve(features.size()); dys.reserve(features.size());
+        xs.reserve(features.size()); ys.reserve(features.size()); us.reserve(features.size()); vs.reserve(features.size());
 
         for (size_t i = 0; i < features.size(); ++i) {
             const float x = features[i].x;
             const float y = features[i].y;
-
             float dx = 0.f, dy = 0.f;
             bool ok = true;
 
@@ -342,7 +429,6 @@ struct Stabilizer::Impl {
 
                         const float i0 = sample_gray_bilinear(gray_prev.data(), w, h, px, py);
                         const float i1 = sample_gray_bilinear(gray_curr.data(), w, h, qx, qy);
-
                         const float gx = 0.5f * (sample_gray_bilinear(gray_prev.data(), w, h, px + 1.f, py) -
                                                  sample_gray_bilinear(gray_prev.data(), w, h, px - 1.f, py));
                         const float gy = 0.5f * (sample_gray_bilinear(gray_prev.data(), w, h, px, py + 1.f) -
@@ -359,12 +445,8 @@ struct Stabilizer::Impl {
                 }
 
                 if (!ok) break;
-
                 const float det = a00 * a11 - a01 * a01;
-                if (det < 1e-4f) {
-                    ok = false;
-                    break;
-                }
+                if (det < 1e-4f) { ok = false; break; }
 
                 const float inv00 = a11 / det;
                 const float inv01 = -a01 / det;
@@ -374,37 +456,49 @@ struct Stabilizer::Impl {
                 dx += step_x;
                 dy += step_y;
 
-                if (step_x * step_x + step_y * step_y < cfg.klt_epsilon * cfg.klt_epsilon) {
-                    break;
-                }
+                if (step_x * step_x + step_y * step_y < cfg.klt_epsilon * cfg.klt_epsilon) break;
             }
 
             if (ok && std::fabs(dx) < static_cast<float>(cfg.search_radius * 2) &&
                 std::fabs(dy) < static_cast<float>(cfg.search_radius * 2)) {
                 dxs.push_back(dx);
                 dys.push_back(dy);
+                xs.push_back(x);
+                ys.push_back(y);
+                us.push_back(x + dx);
+                vs.push_back(y + dy);
             }
         }
 
-        if (dxs.empty()) return std::make_pair(0.f, 0.f);
-        return std::make_pair(median(dxs), median(dys));
+        if (dxs.empty()) return identity_motion();
+
+        if (cfg.motion_model == 1) {
+            Motion2D A;
+            if (estimate_affine_from_matches(xs, ys, us, vs, A)) {
+                return A;
+            }
+        }
+
+        Motion2D t = identity_motion();
+        t.tx = median(dxs);
+        t.ty = median(dys);
+        return t;
     }
 
-    void warp_translate(const uint8_t* input, uint8_t* output, float tx, float ty) const {
+    void warp_affine(const uint8_t* input, uint8_t* output, const Motion2D& M) const {
         const int w = cfg.width;
         const int h = cfg.height;
         const int ch = cfg.input_channels;
 
         for (int y = 0; y < h; ++y) {
             for (int x = 0; x < w; ++x) {
-                const float src_x = static_cast<float>(x) - tx;
-                const float src_y = static_cast<float>(y) - ty;
+                const float src_x = M.a00 * static_cast<float>(x) + M.a01 * static_cast<float>(y) + M.tx;
+                const float src_y = M.a10 * static_cast<float>(x) + M.a11 * static_cast<float>(y) + M.ty;
 
                 const int x0 = static_cast<int>(std::floor(src_x));
                 const int y0 = static_cast<int>(std::floor(src_y));
                 const int x1 = x0 + 1;
                 const int y1 = y0 + 1;
-
                 const float ax = src_x - static_cast<float>(x0);
                 const float ay = src_y - static_cast<float>(y0);
 
@@ -413,11 +507,9 @@ struct Stabilizer::Impl {
                     const float v01 = static_cast<float>(sample_ch(input, w, h, c, ch, x1, y0, cfg.border_mode));
                     const float v10 = static_cast<float>(sample_ch(input, w, h, c, ch, x0, y1, cfg.border_mode));
                     const float v11 = static_cast<float>(sample_ch(input, w, h, c, ch, x1, y1, cfg.border_mode));
-
                     const float top = v00 + ax * (v01 - v00);
                     const float bot = v10 + ax * (v11 - v10);
                     const float val = top + ay * (bot - top);
-
                     output[(y * w + x) * ch + c] = static_cast<uint8_t>(std::max(0.f, std::min(255.f, val)));
                 }
             }
@@ -432,18 +524,15 @@ Stabilizer::~Stabilizer() = default;
 
 void Stabilizer::reset() {
     impl_->initialized = false;
-    impl_->path_x = 0.f;
-    impl_->path_y = 0.f;
-    impl_->smooth_x = 0.f;
-    impl_->smooth_y = 0.f;
-    impl_->path_hist_x.clear();
-    impl_->path_hist_y.clear();
+    impl_->cumulative_motion = identity_motion();
+    for (int i = 0; i < 6; ++i) {
+        impl_->path_hist[i].clear();
+        impl_->smooth_params[i] = (i == 0 || i == 4) ? 1.f : 0.f;
+    }
 }
 
 bool Stabilizer::process(const uint8_t* input, uint8_t* output) {
-    if (!input || !output) {
-        return false;
-    }
+    if (!input || !output) return false;
 
     const size_t frame_bytes = static_cast<size_t>(impl_->cfg.width) * static_cast<size_t>(impl_->cfg.height) *
                                static_cast<size_t>(impl_->cfg.input_channels);
@@ -463,15 +552,18 @@ bool Stabilizer::process(const uint8_t* input, uint8_t* output) {
         return true;
     }
 
-    const std::pair<float, float> motion = impl_->estimate_motion();
-    impl_->path_x += motion.first;
-    impl_->path_y += motion.second;
+    const Motion2D motion = impl_->estimate_motion();
+    impl_->cumulative_motion = compose_motion(motion, impl_->cumulative_motion);
+    const Motion2D smooth_cum = impl_->smooth_cumulative_motion(impl_->cumulative_motion);
 
-    const std::pair<float, float> smooth = impl_->smooth_path(impl_->path_x, impl_->path_y);
-    const float correction_x = smooth.first - impl_->path_x;
-    const float correction_y = smooth.second - impl_->path_y;
+    Motion2D inv_cum;
+    if (!invert_motion(impl_->cumulative_motion, inv_cum)) {
+        inv_cum = identity_motion();
+    }
 
-    impl_->warp_translate(input_read_ptr, output, correction_x, correction_y);
+    const Motion2D correction = compose_motion(smooth_cum, inv_cum);
+    impl_->warp_affine(input_read_ptr, output, correction);
+
     impl_->gray_prev.swap(impl_->gray_curr);
     return true;
 }
@@ -486,9 +578,7 @@ struct RTSdkStabilizerHandle {
 extern "C" {
 
 RTSdkStabilizerHandle* rtsdk_create(const struct RTSdkConfig* cfg) {
-    if (!cfg) {
-        return nullptr;
-    }
+    if (!cfg) return nullptr;
 
     rtsdk::StabilizerConfig cpp;
     cpp.width = cfg->width;
@@ -508,6 +598,7 @@ RTSdkStabilizerHandle* rtsdk_create(const struct RTSdkConfig* cfg) {
     cpp.smoothing_mode = cfg->smoothing_mode;
     cpp.gaussian_radius = cfg->gaussian_radius;
     cpp.gaussian_sigma = cfg->gaussian_sigma;
+    cpp.motion_model = cfg->motion_model;
 
     if (cpp.width <= 0 || cpp.height <= 0 || (cpp.input_channels != 1 && cpp.input_channels != 3)) {
         return nullptr;
@@ -516,20 +607,14 @@ RTSdkStabilizerHandle* rtsdk_create(const struct RTSdkConfig* cfg) {
     return new RTSdkStabilizerHandle(cpp);
 }
 
-void rtsdk_destroy(RTSdkStabilizerHandle* handle) {
-    delete handle;
-}
+void rtsdk_destroy(RTSdkStabilizerHandle* handle) { delete handle; }
 
 void rtsdk_reset(RTSdkStabilizerHandle* handle) {
-    if (handle) {
-        handle->instance.reset();
-    }
+    if (handle) handle->instance.reset();
 }
 
 int rtsdk_process(RTSdkStabilizerHandle* handle, const uint8_t* input, uint8_t* output) {
-    if (!handle) {
-        return 0;
-    }
+    if (!handle) return 0;
     return handle->instance.process(input, output) ? 1 : 0;
 }
 

@@ -24,6 +24,7 @@ struct StabilizerConfig {
     int smoothing_mode = 1;       // 0=EMA, 1=Gaussian (closer to OnePass)
     int gaussian_radius = 15;     // Gaussian smoothing radius
     float gaussian_sigma = -1.f;  // Gaussian sigma (<0 => auto)
+    int motion_model = 1;         // 0=Translation, 1=Affine
 };
 
 class Stabilizer {
@@ -69,6 +70,7 @@ struct RTSdkConfig {
     int smoothing_mode;
     int gaussian_radius;
     float gaussian_sigma;
+    int motion_model;
 };
 
 RTSdkStabilizerHandle* rtsdk_create(const struct RTSdkConfig* cfg);
