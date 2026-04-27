@@ -13,6 +13,7 @@ int main() {
     cfg.motion_estimator = 1; // KLT optical flow
     cfg.smoothing_mode = 1;   // Gaussian smoothing
     cfg.motion_model = 1;     // Affine model
+    cfg.trim_ratio = 0.04f;   // reduce border artifacts
 
     rtsdk::Stabilizer sdk(cfg);
 

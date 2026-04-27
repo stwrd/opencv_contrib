@@ -14,7 +14,7 @@
 1. 灰度化输入帧（可直接传灰度）。
 2. 使用 KLT/SAD 估计相邻帧运动（支持平移 / 仿射模型）。
 3. 对累计轨迹做平滑（支持 EMA / Gaussian，默认 Gaussian 更接近 OnePass），得到稳定轨迹。
-4. 用平滑补偿量做亚像素仿射重采样输出。
+4. 用平滑补偿量做亚像素仿射重采样输出，并支持 `trim_ratio` 中心裁切抑制黑边。
 
 > 该版本侧重“低依赖 + 高可移植 + 易接入”。
 >
@@ -127,6 +127,7 @@ cmake --install build-ios-sim --config Release
   - `smoothing_mode=1`（Gaussian）
   - `gaussian_radius=15`, `gaussian_sigma=-1(自动)`
   - `motion_model=1`（Affine）
+  - `trim_ratio=0.03~0.06`（根据画面边缘黑边情况调节）
 
 ## 高性能编译建议
 

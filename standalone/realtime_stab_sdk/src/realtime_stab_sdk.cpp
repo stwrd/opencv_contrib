@@ -171,6 +171,7 @@ struct Stabilizer::Impl {
         cfg.smoothing_mode = (cfg.smoothing_mode == 0) ? 0 : 1;
         cfg.gaussian_radius = std::max(cfg.gaussian_radius, 1);
         cfg.motion_model = (cfg.motion_model == 0) ? 0 : 1;
+        cfg.trim_ratio = std::min(std::max(cfg.trim_ratio, 0.f), 0.45f);
         if (cfg.gaussian_sigma <= 0.f) {
             cfg.gaussian_sigma = std::max(static_cast<float>(cfg.gaussian_radius) * 0.5f, 1.f);
         }
@@ -489,11 +490,20 @@ struct Stabilizer::Impl {
         const int w = cfg.width;
         const int h = cfg.height;
         const int ch = cfg.input_channels;
+        const float trim = cfg.trim_ratio;
+        const float scale = 1.f - 2.f * trim;
+        const float off_x = trim * static_cast<float>(w);
+        const float off_y = trim * static_cast<float>(h);
 
         for (int y = 0; y < h; ++y) {
             for (int x = 0; x < w; ++x) {
-                const float src_x = M.a00 * static_cast<float>(x) + M.a01 * static_cast<float>(y) + M.tx;
-                const float src_y = M.a10 * static_cast<float>(x) + M.a11 * static_cast<float>(y) + M.ty;
+                float src_x = M.a00 * static_cast<float>(x) + M.a01 * static_cast<float>(y) + M.tx;
+                float src_y = M.a10 * static_cast<float>(x) + M.a11 * static_cast<float>(y) + M.ty;
+
+                if (trim > 0.f) {
+                    src_x = off_x + scale * src_x;
+                    src_y = off_y + scale * src_y;
+                }
 
                 const int x0 = static_cast<int>(std::floor(src_x));
                 const int y0 = static_cast<int>(std::floor(src_y));
@@ -599,6 +609,7 @@ RTSdkStabilizerHandle* rtsdk_create(const struct RTSdkConfig* cfg) {
     cpp.gaussian_radius = cfg->gaussian_radius;
     cpp.gaussian_sigma = cfg->gaussian_sigma;
     cpp.motion_model = cfg->motion_model;
+    cpp.trim_ratio = cfg->trim_ratio;
 
     if (cpp.width <= 0 || cpp.height <= 0 || (cpp.input_channels != 1 && cpp.input_channels != 3)) {
         return nullptr;
