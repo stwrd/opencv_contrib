@@ -42,6 +42,8 @@ public:
     // Input/output buffers are tightly packed HWC (uint8)
     // output can alias input for in-place processing.
     bool process(const uint8_t* input, uint8_t* output);
+    // Flush delayed frames when latency_radius > 0. Returns false when queue is empty.
+    bool flush(uint8_t* output);
 
 private:
     struct Impl;
@@ -81,5 +83,6 @@ RTSdkStabilizerHandle* rtsdk_create(const struct RTSdkConfig* cfg);
 void rtsdk_destroy(RTSdkStabilizerHandle* handle);
 void rtsdk_reset(RTSdkStabilizerHandle* handle);
 int rtsdk_process(RTSdkStabilizerHandle* handle, const uint8_t* input, uint8_t* output);
+int rtsdk_flush(RTSdkStabilizerHandle* handle, uint8_t* output);
 
 }

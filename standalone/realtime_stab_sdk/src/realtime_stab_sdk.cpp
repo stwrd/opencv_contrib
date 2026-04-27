@@ -198,6 +198,7 @@ struct Stabilizer::Impl {
     std::vector<std::vector<uint8_t> > frame_hist;
     int base_frame_idx = 0;
     int latest_frame_idx = -1;
+    int last_emitted_idx = -1;
     std::vector<float> gauss_weights;
 
     void init_gaussian_kernel() {
@@ -566,6 +567,35 @@ struct Stabilizer::Impl {
             }
         }
     }
+
+    bool emit_frame(int target_idx, uint8_t* output) {
+        const int target_off = target_idx - base_frame_idx;
+        if (target_off < 0 || target_off >= static_cast<int>(frame_hist.size())) {
+            return false;
+        }
+
+        const Motion2D& target_cum = cumulative_hist[static_cast<size_t>(target_off)];
+        Motion2D inv_target;
+        if (!invert_motion(target_cum, inv_target)) {
+            inv_target = identity_motion();
+        }
+        const Motion2D smooth_cum = smooth_cumulative_motion_at(target_off);
+        const Motion2D correction = compose_motion(smooth_cum, inv_target);
+        warp_affine(frame_hist[static_cast<size_t>(target_off)].data(), output, correction);
+        last_emitted_idx = target_idx;
+        return true;
+    }
+
+    void prune_history_after_emit() {
+        const int latency = cfg.latency_radius;
+        const int keep_from_idx = (latency > 0) ? (last_emitted_idx - latency) : last_emitted_idx;
+        if (keep_from_idx > base_frame_idx) {
+            const int drop = keep_from_idx - base_frame_idx;
+            frame_hist.erase(frame_hist.begin(), frame_hist.begin() + drop);
+            cumulative_hist.erase(cumulative_hist.begin(), cumulative_hist.begin() + drop);
+            base_frame_idx = keep_from_idx;
+        }
+    }
 };
 
 Stabilizer::Stabilizer(const StabilizerConfig& cfg) : impl_(new Impl(cfg)) {
@@ -579,6 +609,7 @@ void Stabilizer::reset() {
     impl_->frame_hist.clear();
     impl_->base_frame_idx = 0;
     impl_->latest_frame_idx = -1;
+    impl_->last_emitted_idx = -1;
 }
 
 bool Stabilizer::process(const uint8_t* input, uint8_t* output) {
@@ -605,6 +636,7 @@ bool Stabilizer::process(const uint8_t* input, uint8_t* output) {
         impl_->frame_hist.push_back(cur_frame);
         impl_->cumulative_hist.push_back(identity_motion());
         std::memcpy(output, input_read_ptr, frame_bytes);
+        impl_->last_emitted_idx = 0;
         impl_->gray_prev.swap(impl_->gray_curr);
         return true;
     }
@@ -625,31 +657,26 @@ bool Stabilizer::process(const uint8_t* input, uint8_t* output) {
     }
 
     const int target_idx = (latency > 0) ? (impl_->latest_frame_idx - latency) : impl_->latest_frame_idx;
-    const int target_off = target_idx - impl_->base_frame_idx;
-    if (target_off < 0 || target_off >= static_cast<int>(impl_->frame_hist.size())) {
+    if (!impl_->emit_frame(target_idx, output)) {
         std::memcpy(output, input_read_ptr, frame_bytes);
         impl_->gray_prev.swap(impl_->gray_curr);
         return true;
     }
 
-    const Motion2D& target_cum = impl_->cumulative_hist[static_cast<size_t>(target_off)];
-    Motion2D inv_target;
-    if (!invert_motion(target_cum, inv_target)) {
-        inv_target = identity_motion();
-    }
-    const Motion2D smooth_cum = impl_->smooth_cumulative_motion_at(target_off);
-    const Motion2D correction = compose_motion(smooth_cum, inv_target);
-    impl_->warp_affine(impl_->frame_hist[static_cast<size_t>(target_off)].data(), output, correction);
-
-    int keep_from_idx = (latency > 0) ? (target_idx - latency) : target_idx;
-    if (keep_from_idx > impl_->base_frame_idx) {
-        const int drop = keep_from_idx - impl_->base_frame_idx;
-        impl_->frame_hist.erase(impl_->frame_hist.begin(), impl_->frame_hist.begin() + drop);
-        impl_->cumulative_hist.erase(impl_->cumulative_hist.begin(), impl_->cumulative_hist.begin() + drop);
-        impl_->base_frame_idx = keep_from_idx;
-    }
+    impl_->prune_history_after_emit();
 
     impl_->gray_prev.swap(impl_->gray_curr);
+    return true;
+}
+
+bool Stabilizer::flush(uint8_t* output) {
+    if (!output || !impl_->initialized) return false;
+    if (impl_->cfg.latency_radius <= 0) return false;
+
+    const int next_idx = impl_->last_emitted_idx + 1;
+    if (next_idx > impl_->latest_frame_idx) return false;
+    if (!impl_->emit_frame(next_idx, output)) return false;
+    impl_->prune_history_after_emit();
     return true;
 }
 
@@ -703,6 +730,11 @@ void rtsdk_reset(RTSdkStabilizerHandle* handle) {
 int rtsdk_process(RTSdkStabilizerHandle* handle, const uint8_t* input, uint8_t* output) {
     if (!handle) return 0;
     return handle->instance.process(input, output) ? 1 : 0;
+}
+
+int rtsdk_flush(RTSdkStabilizerHandle* handle, uint8_t* output) {
+    if (!handle) return 0;
+    return handle->instance.flush(output) ? 1 : 0;
 }
 
 } // extern "C"
