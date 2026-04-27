@@ -358,32 +358,70 @@ struct Stabilizer::Impl {
                                       Motion2D& out) const {
         if (xs.size() < 6U) return false;
 
-        float ATA[6][6] = {{0}};
-        float ATb[6] = {0};
+        const auto fit_with_mask = [&](const std::vector<uint8_t>& mask, Motion2D& m) -> bool {
+            float ATA[6][6] = {{0}};
+            float ATb[6] = {0};
 
-        for (size_t i = 0; i < xs.size(); ++i) {
-            const float x = xs[i], y = ys[i];
-            const float u = us[i], v = vs[i];
+            int count = 0;
+            for (size_t i = 0; i < xs.size(); ++i) {
+                if (!mask.empty() && !mask[i]) continue;
+                count++;
 
-            const float r1[6] = {x, y, 1.f, 0.f, 0.f, 0.f};
-            const float r2[6] = {0.f, 0.f, 0.f, x, y, 1.f};
+                const float x = xs[i], y = ys[i];
+                const float u = us[i], v = vs[i];
 
-            for (int r = 0; r < 6; ++r) {
-                for (int c = 0; c < 6; ++c) {
-                    ATA[r][c] += r1[r] * r1[c] + r2[r] * r2[c];
+                const float r1[6] = {x, y, 1.f, 0.f, 0.f, 0.f};
+                const float r2[6] = {0.f, 0.f, 0.f, x, y, 1.f};
+
+                for (int r = 0; r < 6; ++r) {
+                    for (int c = 0; c < 6; ++c) {
+                        ATA[r][c] += r1[r] * r1[c] + r2[r] * r2[c];
+                    }
+                    ATb[r] += r1[r] * u + r2[r] * v;
                 }
-                ATb[r] += r1[r] * u + r2[r] * v;
+            }
+
+            if (count < 6) return false;
+
+            float sol[6] = {0};
+            if (!solve_linear_6x6(ATA, ATb, sol)) return false;
+
+            m.a00 = sol[0]; m.a01 = sol[1]; m.tx = sol[2];
+            m.a10 = sol[3]; m.a11 = sol[4]; m.ty = sol[5];
+            const float det = m.a00 * m.a11 - m.a01 * m.a10;
+            return std::fabs(det) >= 1e-5f;
+        };
+
+        if (!fit_with_mask(std::vector<uint8_t>(), out)) return false;
+
+        // Robust re-fit: reject outliers by residual median.
+        std::vector<float> residuals(xs.size(), 0.f);
+        for (size_t i = 0; i < xs.size(); ++i) {
+            const float pu = out.a00 * xs[i] + out.a01 * ys[i] + out.tx;
+            const float pv = out.a10 * xs[i] + out.a11 * ys[i] + out.ty;
+            const float du = pu - us[i];
+            const float dv = pv - vs[i];
+            residuals[i] = std::sqrt(du * du + dv * dv);
+        }
+
+        std::vector<float> residuals_copy = residuals;
+        const float med = median(residuals_copy);
+        const float threshold = std::max(2.5f * med, 2.0f);
+        std::vector<uint8_t> mask(xs.size(), 0);
+        int inliers = 0;
+        for (size_t i = 0; i < residuals.size(); ++i) {
+            if (residuals[i] <= threshold) {
+                mask[i] = 1;
+                inliers++;
             }
         }
 
-        float sol[6] = {0};
-        if (!solve_linear_6x6(ATA, ATb, sol)) return false;
-
-        out.a00 = sol[0]; out.a01 = sol[1]; out.tx = sol[2];
-        out.a10 = sol[3]; out.a11 = sol[4]; out.ty = sol[5];
-
-        const float det = out.a00 * out.a11 - out.a01 * out.a10;
-        if (std::fabs(det) < 1e-5f) return false;
+        if (inliers >= 6) {
+            Motion2D refined;
+            if (fit_with_mask(mask, refined)) {
+                out = refined;
+            }
+        }
         return true;
     }
 
