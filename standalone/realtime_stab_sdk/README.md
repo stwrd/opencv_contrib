@@ -23,6 +23,8 @@
 > 轨迹平滑默认使用 **Gaussian**（`smoothing_mode=1`），EMA 可选（`smoothing_mode=0`）。
 >
 > 运动模型默认使用 **Affine**（`motion_model=1`），可切回平移模型（`motion_model=0`）。
+>
+> 低时延默认 `latency_radius=0`；离线成片可设置 `5~15` 以提高稳定性。
 
 ## 编译
 
@@ -128,6 +130,7 @@ cmake --install build-ios-sim --config Release
   - `gaussian_radius=15`, `gaussian_sigma=-1(自动)`
   - `motion_model=1`（Affine）
   - `trim_ratio=0.03~0.06`（根据画面边缘黑边情况调节）
+  - `latency_radius=0`（实时预览）/ `8~12`（离线成片）
 
 ## 高性能编译建议
 

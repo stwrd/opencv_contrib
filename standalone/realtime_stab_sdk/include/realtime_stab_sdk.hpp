@@ -26,6 +26,7 @@ struct StabilizerConfig {
     float gaussian_sigma = -1.f;  // Gaussian sigma (<0 => auto)
     int motion_model = 1;         // 0=Translation, 1=Affine
     float trim_ratio = 0.04f;     // post-crop ratio [0, 0.45] to suppress border artifacts
+    int latency_radius = 0;       // 0=low-latency, >0 enables delayed output for stronger stability
 };
 
 class Stabilizer {
@@ -73,6 +74,7 @@ struct RTSdkConfig {
     float gaussian_sigma;
     int motion_model;
     float trim_ratio;
+    int latency_radius;
 };
 
 RTSdkStabilizerHandle* rtsdk_create(const struct RTSdkConfig* cfg);

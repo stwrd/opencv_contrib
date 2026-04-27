@@ -172,6 +172,12 @@ struct Stabilizer::Impl {
         cfg.gaussian_radius = std::max(cfg.gaussian_radius, 1);
         cfg.motion_model = (cfg.motion_model == 0) ? 0 : 1;
         cfg.trim_ratio = std::min(std::max(cfg.trim_ratio, 0.f), 0.45f);
+        cfg.latency_radius = std::max(cfg.latency_radius, 0);
+        cfg.gaussian_radius = std::max(cfg.gaussian_radius, 1);
+        cfg.search_radius = std::max(cfg.search_radius, 1);
+        cfg.grid_cols = std::max(cfg.grid_cols, 1);
+        cfg.grid_rows = std::max(cfg.grid_rows, 1);
+        cfg.ema_alpha = std::min(std::max(cfg.ema_alpha, 0.f), 0.9999f);
         if (cfg.gaussian_sigma <= 0.f) {
             cfg.gaussian_sigma = std::max(static_cast<float>(cfg.gaussian_radius) * 0.5f, 1.f);
         }
@@ -180,10 +186,6 @@ struct Stabilizer::Impl {
         gray_curr.resize(cfg.width * cfg.height);
         frame_scratch.resize(static_cast<size_t>(cfg.width) * static_cast<size_t>(cfg.height) *
                              static_cast<size_t>(cfg.input_channels));
-        for (int i = 0; i < 6; ++i) {
-            path_hist[i].reserve(4096);
-            smooth_params[i] = (i == 0 || i == 3) ? 1.f : 0.f;
-        }
     }
 
     StabilizerConfig cfg;
@@ -192,9 +194,10 @@ struct Stabilizer::Impl {
     std::vector<uint8_t> gray_curr;
     std::vector<uint8_t> frame_scratch;
 
-    Motion2D cumulative_motion = identity_motion();
-    float smooth_params[6];
-    std::vector<float> path_hist[6];
+    std::vector<Motion2D> cumulative_hist;
+    std::vector<std::vector<uint8_t> > frame_hist;
+    int base_frame_idx = 0;
+    int latest_frame_idx = -1;
     std::vector<float> gauss_weights;
 
     void init_gaussian_kernel() {
@@ -211,39 +214,77 @@ struct Stabilizer::Impl {
         }
     }
 
-    float smooth_scalar(int idx, float v) {
-        std::vector<float>& hist = path_hist[idx];
-        hist.push_back(v);
+    float get_param(const Motion2D& m, int idx) const {
+        switch (idx) {
+            case 0: return m.a00;
+            case 1: return m.a01;
+            case 2: return m.tx;
+            case 3: return m.a10;
+            case 4: return m.a11;
+            default: return m.ty;
+        }
+    }
+
+    void set_param(Motion2D& m, int idx, float v) const {
+        switch (idx) {
+            case 0: m.a00 = v; break;
+            case 1: m.a01 = v; break;
+            case 2: m.tx = v; break;
+            case 3: m.a10 = v; break;
+            case 4: m.a11 = v; break;
+            default: m.ty = v; break;
+        }
+    }
+
+    Motion2D smooth_cumulative_motion_at(int target_offset) const {
+        Motion2D out = identity_motion();
+        if (target_offset < 0 || target_offset >= static_cast<int>(cumulative_hist.size())) {
+            return out;
+        }
 
         if (cfg.smoothing_mode == 0) {
             const float a = cfg.ema_alpha;
-            smooth_params[idx] = a * smooth_params[idx] + (1.f - a) * v;
-            return smooth_params[idx];
+            Motion2D sm = identity_motion();
+            for (int i = 0; i <= target_offset; ++i) {
+                sm.a00 = a * sm.a00 + (1.f - a) * cumulative_hist[static_cast<size_t>(i)].a00;
+                sm.a01 = a * sm.a01 + (1.f - a) * cumulative_hist[static_cast<size_t>(i)].a01;
+                sm.tx  = a * sm.tx  + (1.f - a) * cumulative_hist[static_cast<size_t>(i)].tx;
+                sm.a10 = a * sm.a10 + (1.f - a) * cumulative_hist[static_cast<size_t>(i)].a10;
+                sm.a11 = a * sm.a11 + (1.f - a) * cumulative_hist[static_cast<size_t>(i)].a11;
+                sm.ty  = a * sm.ty  + (1.f - a) * cumulative_hist[static_cast<size_t>(i)].ty;
+            }
+            return sm;
         }
 
-        if (gauss_weights.empty()) init_gaussian_kernel();
-        float s = 0.f, sw = 0.f;
-        const int n = static_cast<int>(hist.size()) - 1;
-        for (int k = 0; k <= cfg.gaussian_radius; ++k) {
-            const int p = n - k;
-            if (p < 0) break;
-            const float w = gauss_weights[static_cast<size_t>(k)];
-            s += hist[static_cast<size_t>(p)] * w;
-            sw += w;
+        if (gauss_weights.empty()) {
+            const_cast<Impl*>(this)->init_gaussian_kernel();
         }
-        if (sw > 1e-6f) s /= sw;
-        smooth_params[idx] = s;
-        return s;
-    }
 
-    Motion2D smooth_cumulative_motion(const Motion2D& cum) {
-        Motion2D out;
-        out.a00 = smooth_scalar(0, cum.a00);
-        out.a01 = smooth_scalar(1, cum.a01);
-        out.tx  = smooth_scalar(2, cum.tx);
-        out.a10 = smooth_scalar(3, cum.a10);
-        out.a11 = smooth_scalar(4, cum.a11);
-        out.ty  = smooth_scalar(5, cum.ty);
+        const int radius = cfg.gaussian_radius;
+        const bool use_future = cfg.latency_radius > 0;
+        for (int p = 0; p < 6; ++p) {
+            float s = 0.f;
+            float sw = 0.f;
+            if (use_future) {
+                for (int d = -radius; d <= radius; ++d) {
+                    const int idx = target_offset + d;
+                    if (idx < 0 || idx >= static_cast<int>(cumulative_hist.size())) continue;
+                    const float w = gauss_weights[static_cast<size_t>(std::abs(d))];
+                    s += get_param(cumulative_hist[static_cast<size_t>(idx)], p) * w;
+                    sw += w;
+                }
+            } else {
+                for (int d = 0; d <= radius; ++d) {
+                    const int idx = target_offset - d;
+                    if (idx < 0) break;
+                    const float w = gauss_weights[static_cast<size_t>(d)];
+                    s += get_param(cumulative_hist[static_cast<size_t>(idx)], p) * w;
+                    sw += w;
+                }
+            }
+            if (sw > 1e-6f) s /= sw;
+            set_param(out, p, s);
+        }
         return out;
     }
 
@@ -534,11 +575,10 @@ Stabilizer::~Stabilizer() = default;
 
 void Stabilizer::reset() {
     impl_->initialized = false;
-    impl_->cumulative_motion = identity_motion();
-    for (int i = 0; i < 6; ++i) {
-        impl_->path_hist[i].clear();
-        impl_->smooth_params[i] = (i == 0 || i == 4) ? 1.f : 0.f;
-    }
+    impl_->cumulative_hist.clear();
+    impl_->frame_hist.clear();
+    impl_->base_frame_idx = 0;
+    impl_->latest_frame_idx = -1;
 }
 
 bool Stabilizer::process(const uint8_t* input, uint8_t* output) {
@@ -555,24 +595,59 @@ bool Stabilizer::process(const uint8_t* input, uint8_t* output) {
 
     impl_->to_gray(input_read_ptr, impl_->gray_curr);
 
+    std::vector<uint8_t> cur_frame(frame_bytes);
+    std::memcpy(cur_frame.data(), input_read_ptr, frame_bytes);
+
     if (!impl_->initialized) {
+        impl_->initialized = true;
+        impl_->latest_frame_idx = 0;
+        impl_->base_frame_idx = 0;
+        impl_->frame_hist.push_back(cur_frame);
+        impl_->cumulative_hist.push_back(identity_motion());
         std::memcpy(output, input_read_ptr, frame_bytes);
         impl_->gray_prev.swap(impl_->gray_curr);
-        impl_->initialized = true;
         return true;
     }
 
     const Motion2D motion = impl_->estimate_motion();
-    impl_->cumulative_motion = compose_motion(motion, impl_->cumulative_motion);
-    const Motion2D smooth_cum = impl_->smooth_cumulative_motion(impl_->cumulative_motion);
+    const Motion2D prev_cum = impl_->cumulative_hist.back();
+    const Motion2D cur_cum = compose_motion(motion, prev_cum);
 
-    Motion2D inv_cum;
-    if (!invert_motion(impl_->cumulative_motion, inv_cum)) {
-        inv_cum = identity_motion();
+    impl_->latest_frame_idx++;
+    impl_->frame_hist.push_back(cur_frame);
+    impl_->cumulative_hist.push_back(cur_cum);
+
+    const int latency = impl_->cfg.latency_radius;
+    if (latency > 0 && impl_->latest_frame_idx < 2 * latency) {
+        std::memcpy(output, input_read_ptr, frame_bytes);
+        impl_->gray_prev.swap(impl_->gray_curr);
+        return true;
     }
 
-    const Motion2D correction = compose_motion(smooth_cum, inv_cum);
-    impl_->warp_affine(input_read_ptr, output, correction);
+    const int target_idx = (latency > 0) ? (impl_->latest_frame_idx - latency) : impl_->latest_frame_idx;
+    const int target_off = target_idx - impl_->base_frame_idx;
+    if (target_off < 0 || target_off >= static_cast<int>(impl_->frame_hist.size())) {
+        std::memcpy(output, input_read_ptr, frame_bytes);
+        impl_->gray_prev.swap(impl_->gray_curr);
+        return true;
+    }
+
+    const Motion2D& target_cum = impl_->cumulative_hist[static_cast<size_t>(target_off)];
+    Motion2D inv_target;
+    if (!invert_motion(target_cum, inv_target)) {
+        inv_target = identity_motion();
+    }
+    const Motion2D smooth_cum = impl_->smooth_cumulative_motion_at(target_off);
+    const Motion2D correction = compose_motion(smooth_cum, inv_target);
+    impl_->warp_affine(impl_->frame_hist[static_cast<size_t>(target_off)].data(), output, correction);
+
+    int keep_from_idx = (latency > 0) ? (target_idx - latency) : target_idx;
+    if (keep_from_idx > impl_->base_frame_idx) {
+        const int drop = keep_from_idx - impl_->base_frame_idx;
+        impl_->frame_hist.erase(impl_->frame_hist.begin(), impl_->frame_hist.begin() + drop);
+        impl_->cumulative_hist.erase(impl_->cumulative_hist.begin(), impl_->cumulative_hist.begin() + drop);
+        impl_->base_frame_idx = keep_from_idx;
+    }
 
     impl_->gray_prev.swap(impl_->gray_curr);
     return true;
@@ -610,6 +685,7 @@ RTSdkStabilizerHandle* rtsdk_create(const struct RTSdkConfig* cfg) {
     cpp.gaussian_sigma = cfg->gaussian_sigma;
     cpp.motion_model = cfg->motion_model;
     cpp.trim_ratio = cfg->trim_ratio;
+    cpp.latency_radius = cfg->latency_radius;
 
     if (cpp.width <= 0 || cpp.height <= 0 || (cpp.input_channels != 1 && cpp.input_channels != 3)) {
         return nullptr;

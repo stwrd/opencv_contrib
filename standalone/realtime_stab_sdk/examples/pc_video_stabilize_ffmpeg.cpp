@@ -90,6 +90,7 @@ int main(int argc, char** argv) {
     cfg.smoothing_mode = 1;   // Gaussian smoothing
     cfg.motion_model = 1;     // Affine model
     cfg.trim_ratio = 0.04f;   // reduce border artifacts
+    cfg.latency_radius = 10;  // offline rendering: stronger smoothing
 
     rtsdk::Stabilizer sdk(cfg);
 
