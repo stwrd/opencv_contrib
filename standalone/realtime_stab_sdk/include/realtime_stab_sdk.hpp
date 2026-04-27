@@ -21,6 +21,9 @@ struct StabilizerConfig {
     int klt_win_radius = 4;       // KLT: patch radius
     int klt_max_iters = 10;       // KLT: iterations per feature
     float klt_epsilon = 0.01f;    // KLT: convergence threshold
+    int smoothing_mode = 1;       // 0=EMA, 1=Gaussian (closer to OnePass)
+    int gaussian_radius = 15;     // Gaussian smoothing radius
+    float gaussian_sigma = -1.f;  // Gaussian sigma (<0 => auto)
 };
 
 class Stabilizer {
@@ -63,6 +66,9 @@ struct RTSdkConfig {
     int klt_win_radius;
     int klt_max_iters;
     float klt_epsilon;
+    int smoothing_mode;
+    int gaussian_radius;
+    float gaussian_sigma;
 };
 
 RTSdkStabilizerHandle* rtsdk_create(const struct RTSdkConfig* cfg);

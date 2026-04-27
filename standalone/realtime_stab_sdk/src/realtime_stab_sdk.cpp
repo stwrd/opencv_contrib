@@ -99,6 +99,11 @@ struct Stabilizer::Impl {
         cfg.klt_win_radius = std::max(cfg.klt_win_radius, 2);
         cfg.klt_max_iters = std::max(cfg.klt_max_iters, 3);
         cfg.klt_epsilon = std::max(cfg.klt_epsilon, 0.0001f);
+        cfg.smoothing_mode = (cfg.smoothing_mode == 0) ? 0 : 1;
+        cfg.gaussian_radius = std::max(cfg.gaussian_radius, 1);
+        if (cfg.gaussian_sigma <= 0.f) {
+            cfg.gaussian_sigma = std::max(static_cast<float>(cfg.gaussian_radius) * 0.5f, 1.f);
+        }
 
         gray_prev.resize(cfg.width * cfg.height);
         gray_curr.resize(cfg.width * cfg.height);
@@ -116,6 +121,61 @@ struct Stabilizer::Impl {
     float path_y = 0.f;
     float smooth_x = 0.f;
     float smooth_y = 0.f;
+    std::vector<float> path_hist_x;
+    std::vector<float> path_hist_y;
+    std::vector<float> gauss_weights;
+
+    void init_gaussian_kernel() {
+        gauss_weights.resize(static_cast<size_t>(cfg.gaussian_radius + 1), 0.f);
+        float sum = 0.f;
+        for (int i = 0; i <= cfg.gaussian_radius; ++i) {
+            const float x = static_cast<float>(i);
+            const float w = std::exp(-(x * x) / (2.f * cfg.gaussian_sigma * cfg.gaussian_sigma));
+            gauss_weights[static_cast<size_t>(i)] = w;
+            sum += w;
+        }
+        if (sum > 0.f) {
+            for (size_t i = 0; i < gauss_weights.size(); ++i) {
+                gauss_weights[i] /= sum;
+            }
+        }
+    }
+
+    std::pair<float, float> smooth_path(float px, float py) {
+        path_hist_x.push_back(px);
+        path_hist_y.push_back(py);
+
+        if (cfg.smoothing_mode == 0) {
+            const float a = std::min(std::max(cfg.ema_alpha, 0.f), 0.9999f);
+            smooth_x = a * smooth_x + (1.f - a) * px;
+            smooth_y = a * smooth_y + (1.f - a) * py;
+            return std::make_pair(smooth_x, smooth_y);
+        }
+
+        if (gauss_weights.empty()) {
+            init_gaussian_kernel();
+        }
+
+        float sx = 0.f;
+        float sy = 0.f;
+        float sw = 0.f;
+        const int n = static_cast<int>(path_hist_x.size()) - 1;
+        for (int k = 0; k <= cfg.gaussian_radius; ++k) {
+            const int idx = n - k;
+            if (idx < 0) break;
+            const float w = gauss_weights[static_cast<size_t>(k)];
+            sx += path_hist_x[static_cast<size_t>(idx)] * w;
+            sy += path_hist_y[static_cast<size_t>(idx)] * w;
+            sw += w;
+        }
+        if (sw > 1e-6f) {
+            sx /= sw;
+            sy /= sw;
+        }
+        smooth_x = sx;
+        smooth_y = sy;
+        return std::make_pair(smooth_x, smooth_y);
+    }
 
     void to_gray(const uint8_t* input, std::vector<uint8_t>& gray) const {
         const int n = cfg.width * cfg.height;
@@ -365,7 +425,9 @@ struct Stabilizer::Impl {
     }
 };
 
-Stabilizer::Stabilizer(const StabilizerConfig& cfg) : impl_(new Impl(cfg)) {}
+Stabilizer::Stabilizer(const StabilizerConfig& cfg) : impl_(new Impl(cfg)) {
+    impl_->init_gaussian_kernel();
+}
 Stabilizer::~Stabilizer() = default;
 
 void Stabilizer::reset() {
@@ -374,6 +436,8 @@ void Stabilizer::reset() {
     impl_->path_y = 0.f;
     impl_->smooth_x = 0.f;
     impl_->smooth_y = 0.f;
+    impl_->path_hist_x.clear();
+    impl_->path_hist_y.clear();
 }
 
 bool Stabilizer::process(const uint8_t* input, uint8_t* output) {
@@ -403,12 +467,9 @@ bool Stabilizer::process(const uint8_t* input, uint8_t* output) {
     impl_->path_x += motion.first;
     impl_->path_y += motion.second;
 
-    const float a = std::min(std::max(impl_->cfg.ema_alpha, 0.f), 0.9999f);
-    impl_->smooth_x = a * impl_->smooth_x + (1.f - a) * impl_->path_x;
-    impl_->smooth_y = a * impl_->smooth_y + (1.f - a) * impl_->path_y;
-
-    const float correction_x = impl_->smooth_x - impl_->path_x;
-    const float correction_y = impl_->smooth_y - impl_->path_y;
+    const std::pair<float, float> smooth = impl_->smooth_path(impl_->path_x, impl_->path_y);
+    const float correction_x = smooth.first - impl_->path_x;
+    const float correction_y = smooth.second - impl_->path_y;
 
     impl_->warp_translate(input_read_ptr, output, correction_x, correction_y);
     impl_->gray_prev.swap(impl_->gray_curr);
@@ -444,6 +505,9 @@ RTSdkStabilizerHandle* rtsdk_create(const struct RTSdkConfig* cfg) {
     cpp.klt_win_radius = cfg->klt_win_radius;
     cpp.klt_max_iters = cfg->klt_max_iters;
     cpp.klt_epsilon = cfg->klt_epsilon;
+    cpp.smoothing_mode = cfg->smoothing_mode;
+    cpp.gaussian_radius = cfg->gaussian_radius;
+    cpp.gaussian_sigma = cfg->gaussian_sigma;
 
     if (cpp.width <= 0 || cpp.height <= 0 || (cpp.input_channels != 1 && cpp.input_channels != 3)) {
         return nullptr;

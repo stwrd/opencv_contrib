@@ -87,6 +87,7 @@ int main(int argc, char** argv) {
     cfg.grid_rows = 6;
     cfg.ema_alpha = 0.90f;
     cfg.motion_estimator = 1; // KLT optical flow
+    cfg.smoothing_mode = 1;   // Gaussian smoothing
 
     rtsdk::Stabilizer sdk(cfg);
 

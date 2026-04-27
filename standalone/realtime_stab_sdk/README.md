@@ -13,12 +13,14 @@
 
 1. 灰度化输入帧（可直接传灰度）。
 2. 使用网格点 + 局部块匹配（SAD）估计相邻帧全局平移。
-3. 对累计轨迹做 EMA 平滑，得到稳定轨迹。
+3. 对累计轨迹做平滑（支持 EMA / Gaussian，默认 Gaussian 更接近 OnePass），得到稳定轨迹。
 4. 用平滑补偿量做亚像素平移重采样输出。
 
 > 该版本侧重“低依赖 + 高可移植 + 易接入”。
 >
 > 当前默认使用 **KLT 光流**（`motion_estimator=1`），SAD 作为备选（`motion_estimator=0`）。
+>
+> 轨迹平滑默认使用 **Gaussian**（`smoothing_mode=1`），EMA 可选（`smoothing_mode=0`）。
 
 ## 编译
 
@@ -120,6 +122,8 @@ cmake --install build-ios-sim --config Release
   - `ema_alpha=0.90`
   - `motion_estimator=1`（KLT）
   - `max_features=200`, `klt_win_radius=4`, `klt_max_iters=10`
+  - `smoothing_mode=1`（Gaussian）
+  - `gaussian_radius=15`, `gaussian_sigma=-1(自动)`
 
 ## 高性能编译建议
 

@@ -11,6 +11,7 @@ int main() {
     cfg.height = 360;
     cfg.input_channels = 1;
     cfg.motion_estimator = 1; // KLT optical flow
+    cfg.smoothing_mode = 1;   // Gaussian smoothing
 
     rtsdk::Stabilizer sdk(cfg);
 
