@@ -215,63 +215,39 @@ struct Stabilizer::Impl {
         }
     }
 
-    float get_param(const Motion2D& m, int idx) const {
-        switch (idx) {
-            case 0: return m.a00;
-            case 1: return m.a01;
-            case 2: return m.tx;
-            case 3: return m.a10;
-            case 4: return m.a11;
-            default: return m.ty;
-        }
-    }
-
-    void set_param(Motion2D& m, int idx, float v) const {
-        switch (idx) {
-            case 0: m.a00 = v; break;
-            case 1: m.a01 = v; break;
-            case 2: m.tx = v; break;
-            case 3: m.a10 = v; break;
-            case 4: m.a11 = v; break;
-            default: m.ty = v; break;
-        }
+    float get_similarity_param(const Motion2D& m, int idx) const {
+        if (idx == 0) return m.tx;
+        if (idx == 1) return m.ty;
+        if (idx == 2) return std::atan2(m.a10, m.a00); // rotation
+        const float sx = std::sqrt(std::max(0.f, m.a00 * m.a00 + m.a10 * m.a10));
+        const float sy = std::sqrt(std::max(0.f, m.a01 * m.a01 + m.a11 * m.a11));
+        return 0.5f * (sx + sy); // scale
     }
 
     Motion2D smooth_cumulative_motion_at(int target_offset) const {
         Motion2D out = identity_motion();
-        if (target_offset < 0 || target_offset >= static_cast<int>(cumulative_hist.size())) {
-            return out;
-        }
+        if (target_offset < 0 || target_offset >= static_cast<int>(cumulative_hist.size())) return out;
 
-        if (cfg.smoothing_mode == 0) {
-            const float a = cfg.ema_alpha;
-            Motion2D sm = identity_motion();
-            for (int i = 0; i <= target_offset; ++i) {
-                sm.a00 = a * sm.a00 + (1.f - a) * cumulative_hist[static_cast<size_t>(i)].a00;
-                sm.a01 = a * sm.a01 + (1.f - a) * cumulative_hist[static_cast<size_t>(i)].a01;
-                sm.tx  = a * sm.tx  + (1.f - a) * cumulative_hist[static_cast<size_t>(i)].tx;
-                sm.a10 = a * sm.a10 + (1.f - a) * cumulative_hist[static_cast<size_t>(i)].a10;
-                sm.a11 = a * sm.a11 + (1.f - a) * cumulative_hist[static_cast<size_t>(i)].a11;
-                sm.ty  = a * sm.ty  + (1.f - a) * cumulative_hist[static_cast<size_t>(i)].ty;
+        auto smooth_one = [&](int p) -> float {
+            if (cfg.smoothing_mode == 0) {
+                const float a = cfg.ema_alpha;
+                float sm = (p == 3) ? 1.f : 0.f;
+                for (int i = 0; i <= target_offset; ++i) {
+                    sm = a * sm + (1.f - a) * get_similarity_param(cumulative_hist[static_cast<size_t>(i)], p);
+                }
+                return sm;
             }
-            return sm;
-        }
 
-        if (gauss_weights.empty()) {
-            const_cast<Impl*>(this)->init_gaussian_kernel();
-        }
-
-        const int radius = cfg.gaussian_radius;
-        const bool use_future = cfg.latency_radius > 0;
-        for (int p = 0; p < 6; ++p) {
-            float s = 0.f;
-            float sw = 0.f;
+            if (gauss_weights.empty()) const_cast<Impl*>(this)->init_gaussian_kernel();
+            const int radius = cfg.gaussian_radius;
+            const bool use_future = cfg.latency_radius > 0;
+            float s = 0.f, sw = 0.f;
             if (use_future) {
                 for (int d = -radius; d <= radius; ++d) {
                     const int idx = target_offset + d;
                     if (idx < 0 || idx >= static_cast<int>(cumulative_hist.size())) continue;
                     const float w = gauss_weights[static_cast<size_t>(std::abs(d))];
-                    s += get_param(cumulative_hist[static_cast<size_t>(idx)], p) * w;
+                    s += get_similarity_param(cumulative_hist[static_cast<size_t>(idx)], p) * w;
                     sw += w;
                 }
             } else {
@@ -279,13 +255,30 @@ struct Stabilizer::Impl {
                     const int idx = target_offset - d;
                     if (idx < 0) break;
                     const float w = gauss_weights[static_cast<size_t>(d)];
-                    s += get_param(cumulative_hist[static_cast<size_t>(idx)], p) * w;
+                    s += get_similarity_param(cumulative_hist[static_cast<size_t>(idx)], p) * w;
                     sw += w;
                 }
             }
-            if (sw > 1e-6f) s /= sw;
-            set_param(out, p, s);
-        }
+            return (sw > 1e-6f) ? (s / sw) : s;
+        };
+
+        const float x = smooth_one(0);
+        const float y = smooth_one(1);
+        const float angle = smooth_one(2);
+        float scale = smooth_one(3);
+
+        // suppress tiny scale noise (similar to python-side scale denoise intent)
+        if (std::fabs(scale - 1.f) < 0.01f) scale = 1.f;
+        scale = std::min(std::max(scale, 0.95f), 1.05f);
+
+        const float c = std::cos(angle);
+        const float s = std::sin(angle);
+        out.a00 = scale * c;
+        out.a01 = -scale * s;
+        out.a10 = scale * s;
+        out.a11 = scale * c;
+        out.tx = x;
+        out.ty = y;
         return out;
     }
 
