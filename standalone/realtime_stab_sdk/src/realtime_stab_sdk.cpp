@@ -619,7 +619,11 @@ struct Stabilizer::Impl {
         }
         const Motion2D smooth_cum = smooth_cumulative_motion_at(target_off);
         const Motion2D correction = compose_motion(smooth_cum, inv_target);
-        warp_affine(frame_hist[static_cast<size_t>(target_off)].data(), output, correction);
+        Motion2D warp_m;
+        if (!invert_motion(correction, warp_m)) {
+            warp_m = identity_motion();
+        }
+        warp_affine(frame_hist[static_cast<size_t>(target_off)].data(), output, warp_m);
         last_emitted_idx = target_idx;
         return true;
     }

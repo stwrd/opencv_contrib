@@ -24,7 +24,7 @@
 >
 > 运动模型默认使用 **Affine**（`motion_model=1`），可切回平移模型（`motion_model=0`）。
 >
-> 低时延默认 `latency_radius=0`；离线成片可设置 `5~15` 以提高稳定性。
+> 默认 `latency_radius=15`（更稳）；实时预览可改为 `0` 降低时延。
 >
 > 若使用延迟模式，输入结束后请调用 `flush()` / `rtsdk_flush()` 取出尾部缓存帧。
 >
@@ -135,7 +135,7 @@ cmake --install build-ios-sim --config Release
   - `gaussian_radius=15`, `gaussian_sigma=-1(自动)`
   - `motion_model=1`（Affine）
   - `trim_ratio=0.03~0.06`（根据画面边缘黑边情况调节）
-  - `latency_radius=0`（实时预览）/ `8~12`（离线成片）
+  - `latency_radius=15`（默认更稳）/ `0`（实时预览低时延）
 
 离线导出流程建议：
 1. 按帧调用 `process()`;
