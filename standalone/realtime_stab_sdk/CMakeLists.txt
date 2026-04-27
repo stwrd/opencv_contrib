@@ -32,6 +32,8 @@ endif()
 if(RTSDK_BUILD_PC_VIDEO_TEST)
   add_executable(rtsdk_pc_video_test examples/pc_video_stabilize_ffmpeg.cpp)
   target_link_libraries(rtsdk_pc_video_test PRIVATE realtime_stab_sdk)
+  add_executable(rtsdk_stream_playback_sim examples/pc_stream_playback_sim.cpp)
+  target_link_libraries(rtsdk_stream_playback_sim PRIVATE realtime_stab_sdk)
 endif()
 
 install(TARGETS realtime_stab_sdk

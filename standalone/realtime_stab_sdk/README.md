@@ -40,6 +40,7 @@ cmake --build build -j
 默认会编译两个示例：
 - `rtsdk_example`：原始帧流示例
 - `rtsdk_pc_video_test`：PC 端视频输入/输出示例（依赖系统安装 `ffmpeg/ffprobe` 可执行文件）
+- `rtsdk_stream_playback_sim`：模拟“持续播放”队列（约 0.5s 延迟）并流式写出视频
 
 如果你只想产出“可集成库”（不编译示例），加下面两个选项：
 
@@ -173,3 +174,18 @@ sdk.process(input_ptr, output_ptr);
 2. 用 `ffmpeg` 管道把输入解码为 `rgb24` 原始帧；
 3. 调用 SDK 逐帧稳定；
 4. 通过 `ffmpeg` 编码输出稳定视频（H.264 / yuv420p）。
+
+## PC 端“持续播放”仿真示例（输入视频 -> 延迟队列 -> 输出视频）
+
+构建后执行：
+
+```bash
+./build/rtsdk_stream_playback_sim input.mp4 stream_sim_out.mp4
+```
+
+该示例会：
+1. 自动读取输入 fps；
+2. 设置 `latency_radius ≈ 0.5 * fps`；
+3. 按帧调用 `process()`，放入播放队列；
+4. 队列达到阈值后持续写出（模拟稳定播放）；
+5. 结束时 `flushAndReset()` 输出剩余延迟帧。
