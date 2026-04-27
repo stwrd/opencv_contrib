@@ -44,6 +44,8 @@ public:
     bool process(const uint8_t* input, uint8_t* output);
     // Flush delayed frames when latency_radius > 0. Returns false when queue is empty.
     bool flush(uint8_t* output);
+    // Flush one delayed frame; when no delayed frame remains, reset internal state and return false.
+    bool flushAndReset(uint8_t* output);
 
 private:
     struct Impl;
@@ -84,5 +86,6 @@ void rtsdk_destroy(RTSdkStabilizerHandle* handle);
 void rtsdk_reset(RTSdkStabilizerHandle* handle);
 int rtsdk_process(RTSdkStabilizerHandle* handle, const uint8_t* input, uint8_t* output);
 int rtsdk_flush(RTSdkStabilizerHandle* handle, uint8_t* output);
+int rtsdk_flush_and_reset(RTSdkStabilizerHandle* handle, uint8_t* output);
 
 }

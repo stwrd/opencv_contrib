@@ -680,6 +680,16 @@ bool Stabilizer::flush(uint8_t* output) {
     return true;
 }
 
+bool Stabilizer::flushAndReset(uint8_t* output) {
+    if (flush(output)) {
+        return true;
+    }
+    if (impl_->initialized) {
+        reset();
+    }
+    return false;
+}
+
 } // namespace rtsdk
 
 struct RTSdkStabilizerHandle {
@@ -735,6 +745,11 @@ int rtsdk_process(RTSdkStabilizerHandle* handle, const uint8_t* input, uint8_t* 
 int rtsdk_flush(RTSdkStabilizerHandle* handle, uint8_t* output) {
     if (!handle) return 0;
     return handle->instance.flush(output) ? 1 : 0;
+}
+
+int rtsdk_flush_and_reset(RTSdkStabilizerHandle* handle, uint8_t* output) {
+    if (!handle) return 0;
+    return handle->instance.flushAndReset(output) ? 1 : 0;
 }
 
 } // extern "C"

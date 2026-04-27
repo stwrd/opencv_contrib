@@ -27,6 +27,8 @@
 > 低时延默认 `latency_radius=0`；离线成片可设置 `5~15` 以提高稳定性。
 >
 > 若使用延迟模式，输入结束后请调用 `flush()` / `rtsdk_flush()` 取出尾部缓存帧。
+>
+> 若你希望导出完自动清理状态，可使用 `flushAndReset()` / `rtsdk_flush_and_reset()`。
 
 ## 编译
 
@@ -137,6 +139,8 @@ cmake --install build-ios-sim --config Release
 离线导出流程建议：
 1. 按帧调用 `process()`;
 2. 输入结束后循环调用 `flush()` 直到返回 `false`。
+
+或使用便捷模式：循环调用 `flushAndReset()`，最后一次会自动 `reset()`。
 
 ## 高性能编译建议
 

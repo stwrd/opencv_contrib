@@ -129,8 +129,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Flush delayed frames for offline rendering mode (latency_radius > 0).
-    while (sdk.flush(out.data())) {
+    // Flush delayed frames and auto-reset internal state after completion.
+    while (sdk.flushAndReset(out.data())) {
         if (std::fwrite(out.data(), 1, frame_bytes, encoder) != frame_bytes) {
             std::cerr << "Write delayed frame failed." << std::endl;
             PCLOSE(decoder);
